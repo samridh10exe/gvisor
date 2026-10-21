@@ -362,17 +362,21 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 }
 
 // lookupLayerLocked is similar to lookupLocked, but only returns information
-// about the file rather than a dentry.
+// about the file rather than a dentry. If !includeUpper, parent's upper layer
+// is skipped, as if the file had been removed from it.
 //
 // Preconditions:
 //   - fs.renameMu must be locked.
 //   - parent.dirMu must be locked.
-func (fs *filesystem) lookupLayerLocked(ctx context.Context, parent *dentry, name string) (lookupLayer, error) {
+func (fs *filesystem) lookupLayerLocked(ctx context.Context, parent *dentry, name string, includeUpper bool) (lookupLayer, error) {
 	childPath := fspath.Parse(name)
 	lookupLayer := lookupLayerNone
 	var lookupErr error
 
 	parent.iterLayers(func(parentVD vfs.VirtualDentry, isUpper bool) bool {
+		if isUpper && !includeUpper {
+			return true
+		}
 		stat, err := fs.vfsfs.VirtualFilesystem().StatAt(ctx, fs.creds, &vfs.PathOperation{
 			Root:  parentVD,
 			Start: parentVD,
@@ -535,7 +539,7 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct 
 	if _, ok := parent.children[name]; ok {
 		return linuxerr.EEXIST
 	}
-	childLayer, err := fs.lookupLayerLocked(ctx, parent, name)
+	childLayer, err := fs.lookupLayerLocked(ctx, parent, name, true /* includeUpper */)
 	if err != nil {
 		return err
 	}
@@ -592,6 +596,93 @@ func (fs *filesystem) cleanupRecreateWhiteout(ctx context.Context, vfsObj *vfs.V
 	if err := CreateWhiteout(ctx, vfsObj, fs.creds, pop); err != nil {
 		panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to recreate whiteout after failed file creation: %v", err))
 	}
+}
+
+// createTempWhiteoutLocked creates a whiteout with an unused name other than
+// exclude in parent's upper layer directory. While the whiteout exists, the
+// directory can't be removed by other users of the upper filesystem. Unlike
+// Linux, which has a workdir for this, the whiteout is created in parent.
+//
+// Preconditions:
+//   - fs.renameMu must be locked.
+//   - parent.dirMu must be locked.
+//   - parent is copied up.
+func (fs *filesystem) createTempWhiteoutLocked(ctx context.Context, vfsObj *vfs.VirtualFilesystem, parent *dentry, exclude string) (vfs.PathOperation, error) {
+	for {
+		// Same format as Linux's fs/overlayfs/dir.c:ovl_tempname().
+		name := fmt.Sprintf("#%x", fs.lastTempWhiteoutID.Add(1))
+		// Cached children may be copied up without parent.dirMu.
+		if _, ok := parent.children[name]; ok || name == exclude {
+			continue
+		}
+		pop := vfs.PathOperation{
+			Root:  parent.upperVD,
+			Start: parent.upperVD,
+			Path:  fspath.Parse(name),
+		}
+		err := CreateWhiteout(ctx, vfsObj, fs.creds, &pop)
+		if !linuxerr.Equals(linuxerr.EEXIST, err) {
+			return pop, err
+		}
+	}
+}
+
+// removeTempWhiteoutLocked removes a whiteout created by
+// createTempWhiteoutLocked.
+//
+// Preconditions: Same as createTempWhiteoutLocked.
+func (fs *filesystem) removeTempWhiteoutLocked(ctx context.Context, vfsObj *vfs.VirtualFilesystem, pop *vfs.PathOperation) {
+	if err := vfsObj.UnlinkAt(ctx, fs.creds, pop); err != nil && !linuxerr.Equals(linuxerr.ENOENT, err) {
+		// This can only hide an uncached lower layer file with the same name.
+		log.Warningf("overlay: failed to remove temporary whiteout %q: %v", pop.Path, err)
+	}
+}
+
+// replaceWithWhiteoutLocked replaces the file at name in parent's upper layer
+// directory with a whiteout, which is created under a temporary name first so
+// that parent is never empty. Non-directories are replaced by a rename, so
+// failure leaves them in place; directories, which a rename can't replace,
+// are removed first.
+//
+// Preconditions:
+//   - fs.renameMu must be locked.
+//   - parent.dirMu must be locked.
+//   - parent is copied up.
+//   - If isDir, the directory at name is empty on the upper layer.
+func (fs *filesystem) replaceWithWhiteoutLocked(ctx context.Context, vfsObj *vfs.VirtualFilesystem, parent *dentry, name string, isDir bool) error {
+	tmppop, err := fs.createTempWhiteoutLocked(ctx, vfsObj, parent, name)
+	if err != nil {
+		return err
+	}
+	pop := vfs.PathOperation{
+		Root:  parent.upperVD,
+		Start: parent.upperVD,
+		Path:  fspath.Parse(name),
+	}
+	if isDir {
+		if err := rmdirUpper(ctx, vfsObj, fs.creds, &pop); err != nil {
+			fs.removeTempWhiteoutLocked(ctx, vfsObj, &tmppop)
+			return err
+		}
+	}
+	if err := vfsObj.RenameAt(ctx, fs.creds, &tmppop, &pop, &vfs.RenameOptions{}); err != nil {
+		if isDir {
+			panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to move whiteout after removing upper layer directory: %v", err))
+		}
+		fs.removeTempWhiteoutLocked(ctx, vfsObj, &tmppop)
+		return err
+	}
+	return nil
+}
+
+// rmdirUpper removes the directory at pop on the upper layer. A directory that
+// was already removed by another user of the upper filesystem is not an
+// error, since it can't be restored.
+func rmdirUpper(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, pop *vfs.PathOperation) error {
+	if err := vfsObj.RmdirAt(ctx, creds, pop); err != nil && !linuxerr.Equals(linuxerr.ENOENT, err) {
+		return err
+	}
+	return nil
 }
 
 // AccessAt implements vfs.Filesystem.Impl.AccessAt.
@@ -1285,6 +1376,17 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		Path:  fspath.Parse(newName),
 	}
 
+	// Create the origin's whiteout before renaming, so that failure is still
+	// recoverable and oldParent's upper layer directory is never empty.
+	var tmppop vfs.PathOperation
+	if !exchange {
+		tmppop, err = fs.createTempWhiteoutLocked(ctx, vfsObj, oldParent, newName)
+		if err != nil {
+			vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
+			return err
+		}
+	}
+
 	needRecreateWhiteouts := false
 	cleanupRecreateWhiteouts := func() {
 		if !needRecreateWhiteouts {
@@ -1318,6 +1420,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 				}); err != nil {
 					vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
 					cleanupRecreateWhiteouts()
+					fs.removeTempWhiteoutLocked(ctx, vfsObj, &tmppop)
 					return err
 				}
 			}
@@ -1326,6 +1429,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			// on the upper layer will fail with ENOTDIR.
 			if err := vfsObj.UnlinkAt(ctx, fs.creds, &newpop); err != nil {
 				vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
+				fs.removeTempWhiteoutLocked(ctx, vfsObj, &tmppop)
 				return err
 			}
 		}
@@ -1336,10 +1440,10 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	// of whiteouts and may fail with EEXIST if a whiteout exists at newName.
 	opts.Flags &^= linux.RENAME_NOREPLACE
 	// Essentially no gVisor filesystem supports RENAME_WHITEOUT, so just do a
-	// regular rename and create the whiteout at the origin manually. Unlike
-	// RENAME_WHITEOUT, this isn't atomic with respect to other users of the
-	// upper filesystem, but this is already the case for virtually all other
-	// overlay filesystem operations too.
+	// regular rename and move the whiteout created above to the origin
+	// manually. Unlike RENAME_WHITEOUT, this isn't atomic with respect to other
+	// users of the upper filesystem, but this is already the case for
+	// virtually all other overlay filesystem operations too.
 	oldpop := vfs.PathOperation{
 		Root:  oldParent.upperVD,
 		Start: oldParent.upperVD,
@@ -1348,6 +1452,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err := vfsObj.RenameAt(ctx, creds, &oldpop, &newpop, &opts); err != nil {
 		vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
 		cleanupRecreateWhiteouts()
+		if !exchange {
+			fs.removeTempWhiteoutLocked(ctx, vfsObj, &tmppop)
+		}
 		return err
 	}
 
@@ -1421,8 +1528,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	oldParent.dirents = nil
 	toDecRef = vfsObj.CommitRenameReplaceDentry(ctx, &handle, &renamed.vfsd, replacedVFSD)
 
-	if err := CreateWhiteout(ctx, vfsObj, fs.creds, &oldpop); err != nil {
-		panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to create whiteout at origin after RenameAt: %v", err))
+	if err := vfsObj.RenameAt(ctx, fs.creds, &tmppop, &oldpop, &vfs.RenameOptions{}); err != nil {
+		panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to move whiteout to origin after RenameAt: %v", err))
 	}
 	if renamed.isDir() {
 		if err := vfsObj.SetXattrAt(ctx, fs.creds, &newpop, &vfs.SetXattrOptions{
@@ -1544,29 +1651,23 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 				return err
 			}
 		}
-		// Remove the existing directory on the upper layer.
-		if err := vfsObj.RmdirAt(ctx, fs.creds, &pop); err != nil {
+		// Only replace the directory with a whiteout if it exists on a lower
+		// layer.
+		lowerLayer, lerr := fs.lookupLayerLocked(ctx, parent, name, false /* includeUpper */)
+		if lerr == nil && lowerLayer == lookupLayerNone {
+			err = rmdirUpper(ctx, vfsObj, fs.creds, &pop)
+		} else {
+			err = fs.replaceWithWhiteoutLocked(ctx, vfsObj, parent, name, true /* isDir */)
+		}
+		if err != nil {
 			vfsObj.AbortDeleteDentry(&child.vfsd)
 			cleanupRecreateWhiteouts()
 			return err
 		}
-		// Determine if the directory exists on any lower layers; if not, we
-		// can skip creating the whiteout.
-		newChildLayer, err := fs.lookupLayerLocked(ctx, parent, name)
-		if err == nil && newChildLayer == lookupLayerNone {
-			break
-		}
-		fallthrough
 
 	default:
 		if err := CreateWhiteout(ctx, vfsObj, fs.creds, &pop); err != nil {
 			vfsObj.AbortDeleteDentry(&child.vfsd)
-			if child.upperVD.Ok() {
-				// Don't attempt to recover from this: the original directory is
-				// already gone, so any dentries representing it are invalid, and
-				// creating a new directory won't undo that.
-				panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to create whiteout after removing upper layer directory during RmdirAt: %v", err))
-			}
 			return err
 		}
 	}
@@ -1800,28 +1901,20 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 		Start: parent.upperVD,
 		Path:  fspath.Parse(name),
 	}
-	switch childLayer {
-	case lookupLayerUpper:
-		// Remove the existing file on the upper layer.
-		if err := vfsObj.UnlinkAt(ctx, fs.creds, &pop); err != nil {
-			vfsObj.AbortDeleteDentry(&child.vfsd)
-			return err
+	if childLayer == lookupLayerUpper {
+		// Only replace the file with a whiteout if it exists on a lower layer.
+		lowerLayer, lerr := fs.lookupLayerLocked(ctx, parent, name, false /* includeUpper */)
+		if lerr == nil && lowerLayer == lookupLayerNone {
+			err = vfsObj.UnlinkAt(ctx, fs.creds, &pop)
+		} else {
+			err = fs.replaceWithWhiteoutLocked(ctx, vfsObj, parent, name, false /* isDir */)
 		}
-		// Determine if the file exists on any lower layers; if not, we can
-		// skip creating the whiteout.
-		newChildLayer, err := fs.lookupLayerLocked(ctx, parent, name)
-		if err == nil && newChildLayer == lookupLayerNone {
-			break
-		}
-		fallthrough
-	default:
-		if err := CreateWhiteout(ctx, vfsObj, fs.creds, &pop); err != nil {
-			vfsObj.AbortDeleteDentry(&child.vfsd)
-			if childLayer == lookupLayerUpper {
-				panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to create whiteout after unlinking upper layer file during UnlinkAt: %v", err))
-			}
-			return err
-		}
+	} else {
+		err = CreateWhiteout(ctx, vfsObj, fs.creds, &pop)
+	}
+	if err != nil {
+		vfsObj.AbortDeleteDentry(&child.vfsd)
+		return err
 	}
 
 	toDecRef = vfsObj.CommitDeleteDentry(ctx, &child.vfsd)

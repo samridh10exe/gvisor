@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -3392,6 +3393,81 @@ TEST(MountTest, OverlayfsOnGoferBehavior) {
                          sizeof(xattr_buf)),
                 SyscallSucceeds());
     EXPECT_STREQ(xattr_buf, "value");
+  }
+}
+
+// Removing a copied-up file from an overlay must not leave its parent
+// directory empty on the upper layer, where it can be removed concurrently.
+TEST(MountTest, OverlayfsRemoveRacesWithUpperRmdir) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  // Save/restore would make the loop below too slow.
+  const DisableSave ds;
+
+  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  ASSERT_THAT(mount("tmpfs", base_dir.path().c_str(), "tmpfs", 0, nullptr),
+              SyscallSucceeds());
+  auto tmpfs_cleanup =
+      Cleanup([&base_dir] { umount2(base_dir.path().c_str(), MNT_DETACH); });
+  auto lower =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  auto upper =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  auto work = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  auto merged =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  std::string opts = "lowerdir=" + lower.path() + ",upperdir=" + upper.path() +
+                     ",workdir=" + work.path();
+  ASSERT_THAT(
+      mount("overlay", merged.path().c_str(), "overlay", 0, opts.c_str()),
+      SyscallSucceeds());
+  auto overlayfs_cleanup =
+      Cleanup([&merged] { umount2(merged.path().c_str(), MNT_DETACH); });
+
+  enum { kUnlink, kRmdir, kRename, kNumOps };
+  for (int i = 0; i < 100 * kNumOps; i++) {
+    const int op = i % kNumOps;
+    SCOPED_TRACE(absl::StrCat("round ", i));
+    const std::string name = absl::StrCat("d", i);
+    ASSERT_THAT(mkdir(JoinPath(lower.path(), name).c_str(), 0755),
+                SyscallSucceeds());
+    const std::string lower_target = JoinPath(lower.path(), name, "t");
+    if (op == kRmdir) {
+      ASSERT_THAT(mkdir(lower_target.c_str(), 0755), SyscallSucceeds());
+    } else {
+      ASSERT_NO_ERRNO(CreateWithContents(lower_target, "", 0644));
+    }
+    // Copy up target, which leaves it as the only entry in its parent's upper
+    // layer directory.
+    const std::string target = JoinPath(merged.path(), name, "t");
+    ASSERT_THAT(chmod(target.c_str(), 0700), SyscallSucceeds());
+
+    const std::string upper_parent = JoinPath(upper.path(), name);
+    std::atomic<bool> done(false);
+    std::vector<std::unique_ptr<ScopedThread>> threads;
+    for (int t = 0; t < 4; t++) {
+      threads.push_back(std::make_unique<ScopedThread>([&] {
+        while (!done.load()) {
+          rmdir(upper_parent.c_str());
+        }
+      }));
+    }
+    const std::string renamed = JoinPath(merged.path(), name + "t");
+    switch (op) {
+      case kUnlink:
+        EXPECT_THAT(unlink(target.c_str()), SyscallSucceeds());
+        break;
+      case kRmdir:
+        EXPECT_THAT(rmdir(target.c_str()), SyscallSucceeds());
+        break;
+      case kRename:
+        EXPECT_THAT(rename(target.c_str(), renamed.c_str()), SyscallSucceeds());
+        EXPECT_NO_ERRNO(Stat(renamed));
+        break;
+    }
+    done.store(true);
+    threads.clear();
+    // The lower layer target must stay hidden.
+    EXPECT_THAT(access(target.c_str(), F_OK), SyscallFailsWithErrno(ENOENT));
   }
 }
 
