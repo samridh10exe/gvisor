@@ -3396,9 +3396,10 @@ TEST(MountTest, OverlayfsOnGoferBehavior) {
   }
 }
 
-// Removing a copied-up file from an overlay must not leave its parent
-// directory empty on the upper layer, where it can be removed concurrently.
-TEST(MountTest, OverlayfsRemoveRacesWithUpperRmdir) {
+// Replacing a copied-up file with a whiteout, or a whiteout with a file, must
+// not leave its parent directory empty on the upper layer, where it can be
+// removed concurrently.
+TEST(MountTest, OverlayfsWhiteoutRacesWithUpperRmdir) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
   // Save/restore would make the loop below too slow.
   const DisableSave ds;
@@ -3423,8 +3424,8 @@ TEST(MountTest, OverlayfsRemoveRacesWithUpperRmdir) {
   auto overlayfs_cleanup =
       Cleanup([&merged] { umount2(merged.path().c_str(), MNT_DETACH); });
 
-  enum { kUnlink, kRmdir, kRename, kNumOps };
-  for (int i = 0; i < 100 * kNumOps; i++) {
+  enum { kUnlink, kRmdir, kRename, kMkdir, kOpenCreat, kRenameDir, kNumOps };
+  for (int i = 0; i < 300 * kNumOps; i++) {
     const int op = i % kNumOps;
     SCOPED_TRACE(absl::StrCat("round ", i));
     const std::string name = absl::StrCat("d", i);
@@ -3434,12 +3435,21 @@ TEST(MountTest, OverlayfsRemoveRacesWithUpperRmdir) {
     if (op == kRmdir) {
       ASSERT_THAT(mkdir(lower_target.c_str(), 0755), SyscallSucceeds());
     } else {
-      ASSERT_NO_ERRNO(CreateWithContents(lower_target, "", 0644));
+      ASSERT_NO_ERRNO(CreateWithContents(lower_target, "lower", 0644));
     }
-    // Copy up target, which leaves it as the only entry in its parent's upper
+    // Leave target or its whiteout as the only entry in its parent's upper
     // layer directory.
     const std::string target = JoinPath(merged.path(), name, "t");
-    ASSERT_THAT(chmod(target.c_str(), 0700), SyscallSucceeds());
+    const bool over_whiteout = op >= kMkdir;
+    if (over_whiteout) {
+      ASSERT_THAT(unlink(target.c_str()), SyscallSucceeds());
+    } else {
+      ASSERT_THAT(chmod(target.c_str(), 0700), SyscallSucceeds());
+    }
+    const std::string other = JoinPath(merged.path(), name + "t");
+    if (op == kRenameDir) {
+      ASSERT_THAT(mkdir(other.c_str(), 0755), SyscallSucceeds());
+    }
 
     const std::string upper_parent = JoinPath(upper.path(), name);
     std::atomic<bool> done(false);
@@ -3451,7 +3461,6 @@ TEST(MountTest, OverlayfsRemoveRacesWithUpperRmdir) {
         }
       }));
     }
-    const std::string renamed = JoinPath(merged.path(), name + "t");
     switch (op) {
       case kUnlink:
         EXPECT_THAT(unlink(target.c_str()), SyscallSucceeds());
@@ -3460,14 +3469,29 @@ TEST(MountTest, OverlayfsRemoveRacesWithUpperRmdir) {
         EXPECT_THAT(rmdir(target.c_str()), SyscallSucceeds());
         break;
       case kRename:
-        EXPECT_THAT(rename(target.c_str(), renamed.c_str()), SyscallSucceeds());
-        EXPECT_NO_ERRNO(Stat(renamed));
+        EXPECT_THAT(rename(target.c_str(), other.c_str()), SyscallSucceeds());
+        EXPECT_NO_ERRNO(Stat(other));
+        break;
+      case kMkdir:
+        EXPECT_THAT(mkdir(target.c_str(), 0755), SyscallSucceeds());
+        break;
+      case kOpenCreat:
+        EXPECT_NO_ERRNO(Open(target, O_CREAT | O_WRONLY, 0644));
+        break;
+      case kRenameDir:
+        EXPECT_THAT(rename(other.c_str(), target.c_str()), SyscallSucceeds());
         break;
     }
     done.store(true);
     threads.clear();
     // The lower layer target must stay hidden.
-    EXPECT_THAT(access(target.c_str(), F_OK), SyscallFailsWithErrno(ENOENT));
+    if (over_whiteout) {
+      struct stat st;
+      ASSERT_THAT(stat(target.c_str(), &st), SyscallSucceeds());
+      EXPECT_TRUE(S_ISDIR(st.st_mode) || st.st_size == 0);
+    } else {
+      EXPECT_THAT(access(target.c_str(), F_OK), SyscallFailsWithErrno(ENOENT));
+    }
   }
 }
 

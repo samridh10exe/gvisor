@@ -565,8 +565,20 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct 
 		return err
 	}
 
+	haveUpperWhiteout := childLayer == lookupLayerUpperWhiteout
+	if haveUpperWhiteout {
+		// create removes the whiteout first. Keep parent non-empty on the upper
+		// layer meanwhile, so that the whiteout can be recreated on failure.
+		vfsObj := fs.vfsfs.VirtualFilesystem()
+		pin, err := fs.createTempWhiteoutLocked(ctx, vfsObj, parent, name)
+		if err != nil {
+			return err
+		}
+		defer fs.removeTempWhiteoutLocked(ctx, vfsObj, &pin)
+	}
+
 	// Finally create the new file.
-	if err := create(parent, name, childLayer == lookupLayerUpperWhiteout, &ds); err != nil {
+	if err := create(parent, name, haveUpperWhiteout, &ds); err != nil {
 		return err
 	}
 
@@ -593,8 +605,9 @@ func CreateWhiteout(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *a
 }
 
 func (fs *filesystem) cleanupRecreateWhiteout(ctx context.Context, vfsObj *vfs.VirtualFilesystem, pop *vfs.PathOperation) {
-	if err := CreateWhiteout(ctx, vfsObj, fs.creds, pop); err != nil {
-		panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to recreate whiteout after failed file creation: %v", err))
+	// On EEXIST, whatever is at pop already hides the lower layer file.
+	if err := CreateWhiteout(ctx, vfsObj, fs.creds, pop); err != nil && !linuxerr.Equals(linuxerr.EEXIST, err) {
+		panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to recreate whiteout: %v", err))
 	}
 }
 
@@ -845,7 +858,7 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 				Name:  fs.xattrOpaque,
 				Value: "y",
 			}); err != nil {
-				if cleanupErr := vfsObj.RmdirAt(ctx, fs.creds, &pop); cleanupErr != nil {
+				if cleanupErr := rmdirUpper(ctx, vfsObj, fs.creds, &pop); cleanupErr != nil {
 					panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to delete upper layer directory after MkdirAt set-opaque failure: %v", cleanupErr))
 				} else {
 					fs.cleanupRecreateWhiteout(ctx, vfsObj, &pop)
@@ -1103,6 +1116,12 @@ func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.Resolving
 	}
 	// Unlink the whiteout if it exists.
 	if haveUpperWhiteout {
+		// See doCreateAt.
+		pin, err := fs.createTempWhiteoutLocked(ctx, vfsObj, parent, childName)
+		if err != nil {
+			return nil, err
+		}
+		defer fs.removeTempWhiteoutLocked(ctx, vfsObj, &pin)
 		if err := vfsObj.UnlinkAt(ctx, fs.creds, &pop); err != nil {
 			log.Warningf("overlay.filesystem.createAndOpenLocked: failed to unlink whiteout: %v", err)
 			return nil, err
@@ -1388,6 +1407,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 
 	needRecreateWhiteouts := false
+	needRecreateNewWhiteout := false
 	cleanupRecreateWhiteouts := func() {
 		if !needRecreateWhiteouts {
 			return
@@ -1426,12 +1446,24 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			}
 		} else if replacedLayer == lookupLayerUpperWhiteout {
 			// We need to explicitly remove the whiteout since otherwise rename
-			// on the upper layer will fail with ENOTDIR.
+			// on the upper layer will fail with ENOTDIR. Pin newParent so that the
+			// whiteout can be recreated if the rename fails; tmppop pins
+			// oldParent.
+			if oldParent != newParent {
+				pin, err := fs.createTempWhiteoutLocked(ctx, vfsObj, newParent, newName)
+				if err != nil {
+					vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
+					fs.removeTempWhiteoutLocked(ctx, vfsObj, &tmppop)
+					return err
+				}
+				defer fs.removeTempWhiteoutLocked(ctx, vfsObj, &pin)
+			}
 			if err := vfsObj.UnlinkAt(ctx, fs.creds, &newpop); err != nil {
 				vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
 				fs.removeTempWhiteoutLocked(ctx, vfsObj, &tmppop)
 				return err
 			}
+			needRecreateNewWhiteout = true
 		}
 	}
 
@@ -1452,6 +1484,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err := vfsObj.RenameAt(ctx, creds, &oldpop, &newpop, &opts); err != nil {
 		vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
 		cleanupRecreateWhiteouts()
+		if needRecreateNewWhiteout {
+			fs.cleanupRecreateWhiteout(ctx, vfsObj, &newpop)
+		}
 		if !exchange {
 			fs.removeTempWhiteoutLocked(ctx, vfsObj, &tmppop)
 		}
